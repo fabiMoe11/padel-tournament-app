@@ -1,0 +1,452 @@
+import { useEffect, useMemo, useState } from 'react';
+import {
+  buildLiveInfo,
+  createDemoRoundScores,
+  determineWinner,
+  exportResultsCsv,
+  generateRound,
+  getActivePlayerCount,
+  getByeInfo,
+  isRoundReady,
+  rankPlayers,
+  selectByes,
+  tournamentSettings,
+  uniqueValidPlayers,
+} from './lib/tournament';
+import { localStorageAdapter, resolveStorageAdapter } from './lib/storage';
+import type { MatchResult, RoundRecord, TournamentState } from './types';
+
+const emptyTournamentState: TournamentState = {
+  players: Array.from({ length: 16 }, () => ''),
+  started: false,
+  currentRound: 1,
+  rounds: [],
+  winner: null,
+  demoMode: false,
+};
+
+function App() {
+  const [players, setPlayers] = useState<string[]>(Array.from({ length: 16 }, () => ''));
+  const [tournament, setTournament] = useState<TournamentState>(emptyTournamentState);
+  const [storageReady, setStorageReady] = useState(false);
+  const [view, setView] = useState<'setup' | 'round' | 'leaderboard' | 'schedule'>('setup');
+  const [pendingScores, setPendingScores] = useState<Record<string, { scoreA: number; scoreB: number }>>({});
+  const [preview, setPreview] = useState<RoundRecord | null>(null);
+  const [displayLarge, setDisplayLarge] = useState(true);
+
+  useEffect(() => {
+    const adapter = resolveStorageAdapter();
+    adapter.read().then((saved) => {
+      if (saved && saved.players?.length) {
+        setTournament(saved);
+        setPlayers(saved.players);
+        setView(saved.started ? 'round' : 'setup');
+      }
+      setStorageReady(true);
+    });
+  }, []);
+
+  useEffect(() => {
+    if (!storageReady) return;
+    const adapter = resolveStorageAdapter();
+    adapter.write(tournament).catch(() => undefined);
+  }, [tournament, storageReady]);
+
+  const validPlayers = useMemo(() => uniqueValidPlayers(players), [players]);
+  const summary = buildLiveInfo(validPlayers);
+
+  const standings = useMemo(() => rankPlayers(validPlayers, tournament.rounds), [validPlayers, tournament.rounds]);
+
+  function updatePlayer(index: number, value: string) {
+    setPlayers((previous) => {
+      const next = [...previous];
+      next[index] = value;
+      return next;
+    });
+  }
+
+  function addPlayerRow() {
+    if (players.length >= 25) return;
+    setPlayers((previous) => [...previous, '']);
+  }
+
+  function removePlayerRow(index: number) {
+    setPlayers((previous) => previous.filter((_, idx) => idx !== index));
+  }
+
+  function validatePlayers() {
+    const unique = uniqueValidPlayers(players);
+    if (unique.length < 4 || unique.length > 25) {
+      return false;
+    }
+    return true;
+  }
+
+  function generateRoundForCurrentState(roundNumber: number): RoundRecord {
+    const history = { byeCounts: {}, lastByeRound: {}, lastByeTimestamp: {}, partnerCounts: {}, opponentCounts: {}, courtCounts: {}, playerStats: {} };
+    const generated = generateRound(validPlayers, history, { roundNumber }, roundNumber);
+    return { roundNumber, byes: generated.byes, matches: generated.matches, submitted: false };
+  }
+
+  function startTournament() {
+    if (!validatePlayers()) {
+      return;
+    }
+    const names = uniqueValidPlayers(players);
+    const firstRound = generateRoundForCurrentState(1);
+    setTournament({
+      players: names,
+      started: true,
+      startedAt: Date.now(),
+      currentRound: 1,
+      rounds: [firstRound],
+      winner: null,
+      demoMode: false,
+    });
+    setView('round');
+  }
+
+  function getCurrentRoundRecord(): RoundRecord | undefined {
+    return tournament.rounds.find((round) => round.roundNumber === tournament.currentRound);
+  }
+
+  function submitRound() {
+    const round = getCurrentRoundRecord();
+    if (!round) return;
+    const matches = round.matches.map((match) => {
+      const scores = pendingScores[match.teamA.join('-') + ':' + match.teamB.join('-')];
+      if (!scores) return match;
+      return {
+        ...match,
+        scoreA: scores.scoreA,
+        scoreB: scores.scoreB,
+      };
+    });
+
+    const updated = {
+      ...round,
+      matches,
+      submitted: true,
+    };
+
+    const nextRounds = tournament.rounds.map((item) => (item.roundNumber === updated.roundNumber ? updated : item));
+    const nextRoundNumber = updated.roundNumber + 1;
+
+    setTournament((previous) => {
+      const winner = nextRoundNumber > tournamentSettings.totalRounds ? determineWinner(previous.players, nextRounds) : previous.winner;
+      return {
+        ...previous,
+        rounds: nextRounds,
+        currentRound: nextRoundNumber,
+        winner,
+      };
+    });
+
+    if (updated.roundNumber < tournamentSettings.totalRounds) {
+      const previewRound = generateRoundForCurrentState(nextRoundNumber);
+      setPreview(previewRound);
+      setView('round');
+    } else {
+      setPreview(null);
+      setView('leaderboard');
+    }
+  }
+
+  function confirmPreview() {
+    if (!preview) return;
+    setTournament((previous) => ({
+      ...previous,
+      rounds: [...previous.rounds, preview],
+      currentRound: preview.roundNumber,
+      preview: undefined,
+    }));
+    setPreview(null);
+    setView('round');
+  }
+
+  function reshufflePreview() {
+    if (!preview) return;
+    setPreview(generateRoundForCurrentState(preview.roundNumber));
+  }
+
+  function resetTournament() {
+    const confirmed = window.confirm('Reset tournament? This will clear the current state.');
+    if (!confirmed) return;
+    const finalConfirm = window.confirm('This action cannot be undone. Confirm reset.');
+    if (!finalConfirm) return;
+
+    setTournament(emptyTournamentState);
+    setPlayers(Array.from({ length: 16 }, () => ''));
+    setView('setup');
+    setPreview(null);
+    localStorageAdapter.clear();
+  }
+
+  function fillDemoMode() {
+    const names = uniqueValidPlayers(players);
+    if (names.length < 4) return;
+    const rounds: RoundRecord[] = [];
+    const roundNames = [...names];
+    let current = roundNames;
+
+    for (let roundNumber = 1; roundNumber <= tournamentSettings.totalRounds; roundNumber += 1) {
+      const generated = generateRound(current, { byeCounts: {}, lastByeRound: {}, lastByeTimestamp: {}, partnerCounts: {}, opponentCounts: {}, courtCounts: {} }, { roundNumber }, roundNumber);
+      const filled = createDemoRoundScores({ roundNumber, matches: generated.matches, byes: generated.byes, submitted: false });
+      rounds.push({ ...filled, submitted: true });
+      current = [...current.filter((name) => !generated.byes.includes(name))];
+    }
+
+    setTournament({
+      players: names,
+      started: true,
+      startedAt: Date.now(),
+      currentRound: tournamentSettings.totalRounds + 1,
+      rounds,
+      winner: determineWinner(names, rounds),
+      demoMode: true,
+    });
+    setView('leaderboard');
+  }
+
+  function exportCsv() {
+    const csv = exportResultsCsv(validPlayers, tournament.rounds);
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = 'tournament-results.csv';
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
+  const roundRecord = getCurrentRoundRecord();
+  const roundIsReady = roundRecord ? isRoundReady(roundRecord) : false;
+
+  return (
+    <div className={`app-shell ${displayLarge ? 'large-display' : ''}`}>
+      <header className="topbar">
+        <div>
+          <p className="eyebrow">Americano / Mexicano hybrid</p>
+          <h1>Padel Tournament Manager</h1>
+        </div>
+        <div className="header-actions">
+          <button className="secondary" onClick={() => setDisplayLarge((value) => !value)}>
+            {displayLarge ? 'Standard view' : 'Large display'}
+          </button>
+          <button className="secondary" onClick={exportCsv}>Export CSV</button>
+          <button className="warning" onClick={resetTournament}>Reset tournament</button>
+        </div>
+      </header>
+
+      <nav className="tabs">
+        <button className={view === 'setup' ? 'active' : ''} onClick={() => setView('setup')}>Setup</button>
+        <button className={view === 'round' ? 'active' : ''} onClick={() => setView('round')} disabled={!tournament.started}>Round</button>
+        <button className={view === 'leaderboard' ? 'active' : ''} onClick={() => setView('leaderboard')} disabled={!tournament.started}>Leaderboard</button>
+        <button className={view === 'schedule' ? 'active' : ''} onClick={() => setView('schedule')} disabled={!tournament.started}>Schedule</button>
+      </nav>
+
+      {view === 'setup' && (
+        <main className="panel setup-panel">
+          <section className="setup-section">
+            <div className="title-row">
+              <h2>Player list</h2>
+              <button className="secondary" onClick={addPlayerRow}>Add player</button>
+            </div>
+
+            <div className="player-grid">
+              {players.map((player, index) => (
+                <div className="player-row" key={`player-${index}`}>
+                  <label className="player-label">Player {index + 1}</label>
+                  <input
+                    value={player}
+                    onChange={(event) => updatePlayer(index, event.target.value)}
+                    placeholder="Player name"
+                  />
+                  <button type="button" className="ghost" onClick={() => removePlayerRow(index)} disabled={players.length <= 4}>Remove</button>
+                </div>
+              ))}
+            </div>
+
+            <div className="info-box">
+              <strong>Live info</strong>
+              <p>{summary}</p>
+            </div>
+
+            <div className="action-row">
+              <button className="primary" disabled={!validatePlayers()} onClick={startTournament}>Start tournament</button>
+              <button className="secondary" onClick={fillDemoMode}>Demo mode</button>
+            </div>
+          </section>
+        </main>
+      )}
+
+      {view === 'round' && tournament.started && (
+        <main className="panel">
+          <div className="round-header">
+            <h2>{`Round ${tournament.currentRound} of ${tournamentSettings.totalRounds}`}</h2>
+            {preview && (
+              <div className="preview-banner">
+                <strong>Preview next round</strong>
+                <div className="preview-actions">
+                  <button className="secondary" onClick={reshufflePreview}>Reshuffle</button>
+                  <button className="primary" onClick={confirmPreview}>Confirm</button>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {preview ? (
+            <div className="court-grid preview-grid">
+              {preview.matches.map((match, index) => (
+                <div className="court-card" key={`preview-match-${index}`}>
+                  <h3>{`Court ${index + 1}`}</h3>
+                  <div className="team-row">
+                    <span>{match.teamA[0]}</span>
+                    <span>{match.teamA[1]}</span>
+                  </div>
+                  <div className="versus">vs</div>
+                  <div className="team-row">
+                    <span>{match.teamB[0]}</span>
+                    <span>{match.teamB[1]}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          ) : roundRecord && (
+            <>
+              <div className="bye-box">
+                <h3>Byes</h3>
+                <div className="bye-list">{roundRecord.byes.length ? roundRecord.byes.join(', ') : 'No players on a bye'}</div>
+              </div>
+
+              <div className="court-grid">
+                {roundRecord.matches.map((match, index) => (
+                  <div className="court-card" key={`court-${index}`}>
+                    <h3>{`Court ${index + 1}`}</h3>
+                    <div className="team-row">
+                      <span>{match.teamA[0]}</span>
+                      <span>{match.teamA[1]}</span>
+                    </div>
+                    <div className="versus">vs</div>
+                    <div className="team-row">
+                      <span>{match.teamB[0]}</span>
+                      <span>{match.teamB[1]}</span>
+                    </div>
+                    <div className="score-row">
+                      <input
+                        type="number"
+                        min="0"
+                        value={pendingScores[match.teamA.join('-') + ':' + match.teamB.join('-')]?.scoreA ?? match.scoreA ?? 0}
+                        onChange={(event) => {
+                          const next = Number(event.target.value);
+                          const key = match.teamA.join('-') + ':' + match.teamB.join('-');
+                          setPendingScores((previous) => ({
+                            ...previous,
+                            [key]: {
+                              scoreA: next,
+                              scoreB: previous[key]?.scoreB ?? match.scoreB ?? 0,
+                            },
+                          }));
+                        }}
+                      />
+                      <input
+                        type="number"
+                        min="0"
+                        value={pendingScores[match.teamA.join('-') + ':' + match.teamB.join('-')]?.scoreB ?? match.scoreB ?? 0}
+                        onChange={(event) => {
+                          const next = Number(event.target.value);
+                          const key = match.teamA.join('-') + ':' + match.teamB.join('-');
+                          setPendingScores((previous) => ({
+                            ...previous,
+                            [key]: {
+                              scoreA: previous[key]?.scoreA ?? match.scoreA ?? 0,
+                              scoreB: next,
+                            },
+                          }));
+                        }}
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+
+              <div className="submit-area">
+                <button
+                  className="primary"
+                  disabled={!roundIsReady}
+                  onClick={() => {
+                    const confirmed = window.confirm('Scores cannot be changed after submitting. Continue?');
+                    if (confirmed) submitRound();
+                  }}
+                >
+                  Submit round
+                </button>
+              </div>
+            </>
+          )}
+        </main>
+      )}
+
+      {view === 'leaderboard' && tournament.started && (
+        <main className="panel">
+          <h2>Leaderboard</h2>
+          <table>
+            <thead>
+              <tr>
+                <th>Rank</th>
+                <th>Name</th>
+                <th>Avg points</th>
+                <th>Total points</th>
+                <th>Matches</th>
+                <th>Byes</th>
+                <th>Avg +/−</th>
+                <th>W/T/L</th>
+                <th>Games</th>
+              </tr>
+            </thead>
+            <tbody>
+              {standings.map((player, index) => (
+                <tr key={player.name} className={index < 3 ? 'top-three' : ''}>
+                  <td>{index + 1}</td>
+                  <td>{player.name}</td>
+                  <td>{player.avgPoints.toFixed(2)}</td>
+                  <td>{player.totalPoints}</td>
+                  <td>{player.matchesPlayed}</td>
+                  <td>{player.byes}</td>
+                  <td>{player.avgGameDifferential.toFixed(2)}</td>
+                  <td>{`${player.wins}/${player.ties}/${player.losses}`}</td>
+                  <td>{`${player.gamesWon}-${player.gamesLost}`}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </main>
+      )}
+
+      {view === 'schedule' && tournament.started && (
+        <main className="panel">
+          <h2>Schedule and history</h2>
+          <div className="history-list">
+            {tournament.rounds.map((round) => (
+              <div className="history-card" key={`history-round-${round.roundNumber}`}>
+                <h3>Round {round.roundNumber}</h3>
+                <div className="bye-list">Byes: {round.byes.length ? round.byes.join(', ') : 'None'}</div>
+                <div className="match-rows">
+                  {round.matches.map((match, index) => (
+                    <div key={`${round.roundNumber}-match-${index}`} className="history-match">
+                      <strong>{`Court ${index + 1}`}</strong>
+                      <span>{`${match.teamA.join(' / ')} vs ${match.teamB.join(' / ')}`}</span>
+                      <span>{`${match.scoreA} - ${match.scoreB}`}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </main>
+      )}
+    </div>
+  );
+}
+
+export default App;
